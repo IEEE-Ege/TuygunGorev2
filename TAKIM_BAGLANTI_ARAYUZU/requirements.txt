@@ -5,3 +5,4 @@ tqdm
 opencv-python>=4.8.0
 numpy>=1.24.0
 flask>=3.0.0
+matplotlib>=3.8.0
