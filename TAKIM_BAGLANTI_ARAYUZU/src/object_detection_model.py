@@ -32,9 +32,9 @@ class VisualOdometry:
     """
     Monocular VO for near-nadir UAV camera.
 
-    XY : Lucas-Kanade sparse optical flow → affine → scaled translation
-    Z  : velocity model extrapolated from GPS-healthy altitude history
-    Scale: calibrated from consecutive GT XY deltas vs pixel flow deltas
+    XY : LK optical flow → affine transform → translation in pixels → metres
+    Z  : altitude velocity model from GPS=1 history
+    Scale (m/px): calibrated as GT_xy_delta / raw_pixel_delta — no feedback loop
     """
 
     def __init__(self, K: np.ndarray, dist: np.ndarray):
@@ -46,15 +46,18 @@ class VisualOdometry:
         self.prev_gray: np.ndarray | None = None
         self.prev_pts: np.ndarray | None = None
 
-        self.xy_scale = 1.0
-        self._scale_samples: list[float] = []
+        # Per-axis scale: metres per pixel (calibrated from GT separately for X and Y)
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+        self._scale_x_samples: list[float] = []
+        self._scale_y_samples: list[float] = []
+
+        # Last raw pixel delta (set by update, read by calibrate)
+        self._last_px_delta: np.ndarray | None = None
 
         # Z velocity model
         self._z_deltas: deque = deque(maxlen=30)
         self._z_velocity = 0.0
-
-        self._prev_vo_xy = np.zeros(2, dtype=np.float64)
-        self._curr_pts_tracked: np.ndarray | None = None  # for feature refresh
 
     # ------------------------------------------------------------------
     def _undistort(self, gray: np.ndarray) -> np.ndarray:
@@ -70,7 +73,8 @@ class VisualOdometry:
         mask = status.ravel().astype(bool)
         return prev_pts[mask], curr_pts[mask]
 
-    def _affine_xy_delta(self, src, dst) -> np.ndarray | None:
+    def _affine_delta(self, src, dst) -> np.ndarray | None:
+        """Fit partial affine (rotation+scale+translation); return tx,ty in pixels."""
         if len(src) < 8:
             return None
         M, inliers = cv2.estimateAffinePartial2D(
@@ -78,26 +82,41 @@ class VisualOdometry:
         )
         if M is None or (inliers is not None and inliers.sum() < 6):
             return None
-        return np.array([M[0, 2], M[1, 2]], dtype=np.float64)
+        return np.array([M[0, 2], M[1, 2]], dtype=np.float64)  # raw pixels
 
     # ------------------------------------------------------------------
     def calibrate(self, gt_pos: np.ndarray, prev_gt_pos: np.ndarray):
-        """Update XY scale and Z velocity from GT. Call on every GPS=1 frame."""
+        """
+        Update m/px scale and Z velocity from GT.
+        Uses raw pixel delta stored by last update() — no feedback loop.
+        """
         # Z velocity
-        self._z_deltas.append(gt_pos[2] - prev_gt_pos[2])
+        dz = gt_pos[2] - prev_gt_pos[2]
+        self._z_deltas.append(dz)
         if len(self._z_deltas) >= 5:
             self._z_velocity = float(np.median(list(self._z_deltas)))
 
-        # XY scale
-        gt_xy = np.linalg.norm(gt_pos[:2] - prev_gt_pos[:2])
-        vo_xy = np.linalg.norm(self.pos[:2] - self._prev_vo_xy)
-        if gt_xy > 0.05 and vo_xy > 0.5:
-            s = gt_xy / vo_xy
-            if 1e-4 < s < 1e3:
-                self._scale_samples.append(s)
-                if len(self._scale_samples) > 60:
-                    self._scale_samples.pop(0)
-                self.xy_scale = float(np.median(self._scale_samples))
+        # Per-axis scale: metres / pixel (X and Y calibrated independently)
+        if self._last_px_delta is not None:
+            px = self._last_px_delta
+            gt_dx = gt_pos[0] - prev_gt_pos[0]
+            gt_dy = gt_pos[1] - prev_gt_pos[1]
+
+            if abs(gt_dx) > 0.05 and abs(px[0]) > 1.0:
+                sx = abs(gt_dx) / abs(px[0])
+                if 1e-6 < sx < 100.0:
+                    self._scale_x_samples.append(sx)
+                    if len(self._scale_x_samples) > 60:
+                        self._scale_x_samples.pop(0)
+                    self.scale_x = float(np.median(self._scale_x_samples))
+
+            if abs(gt_dy) > 0.05 and abs(px[1]) > 1.0:
+                sy = abs(gt_dy) / abs(px[1])
+                if 1e-6 < sy < 100.0:
+                    self._scale_y_samples.append(sy)
+                    if len(self._scale_y_samples) > 60:
+                        self._scale_y_samples.pop(0)
+                    self.scale_y = float(np.median(self._scale_y_samples))
 
     def reset_to(self, gt_pos: np.ndarray):
         self.pos = gt_pos.copy()
@@ -106,18 +125,19 @@ class VisualOdometry:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         gray = self._undistort(gray)
 
+        self._last_px_delta = None
         tracked_curr: np.ndarray | None = None
 
         if self.prev_gray is not None and self.prev_pts is not None and len(self.prev_pts) >= 10:
             prev_good, curr_good = self._track(self.prev_gray, gray, self.prev_pts)
 
             if len(prev_good) >= 8:
-                delta_px = self._affine_xy_delta(prev_good, curr_good)
+                delta_px = self._affine_delta(prev_good, curr_good)
                 if delta_px is not None:
-                    self._prev_vo_xy = self.pos[:2].copy()
-                    # Nadir camera: image x/y shift → world -x/-y (camera looking down)
-                    self.pos[0] -= delta_px[0] * self.xy_scale
-                    self.pos[1] -= delta_px[1] * self.xy_scale
+                    self._last_px_delta = delta_px.copy()
+                    # Nadir camera: image shifts opposite to drone XY motion
+                    self.pos[0] -= delta_px[0] * self.scale_x
+                    self.pos[1] -= delta_px[1] * self.scale_y
                     self.pos[2] += self._z_velocity
 
                 tracked_curr = curr_good.reshape(-1, 1, 2)
@@ -174,7 +194,6 @@ class ObjectDetectionModel:
         return self.detect(prediction, health_status)
 
     def _run_object_detection(self, img_path: str, prediction):
-        """Görev 1 entegrasyon noktası."""
         if self.det_model is None:
             return
 
@@ -217,6 +236,9 @@ class ObjectDetectionModel:
             tx, ty, tz = gt_pos[0], gt_pos[1], gt_pos[2]
 
         else:
+            # GPS yeni kesildi: VO'yu son bilinen GT konumuna sıfırla
+            if self._prev_health == '1':
+                self.vo.reset_to(self._prev_gt)
             if frame is not None:
                 pos = self.vo.update(frame)
             else:

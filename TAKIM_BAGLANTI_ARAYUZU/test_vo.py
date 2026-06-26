@@ -137,12 +137,15 @@ def run_frames(frames_dir: str, csv_path: str, health_split: float,
 
         if health == "1" and gt_pos is not None:
             vo.update(frame)
-            vo.calibrate_scale(gt_pos, prev_gt)
+            vo.calibrate(gt_pos, prev_gt)
             if prev_health == "0":
                 vo.reset_to(gt_pos)
             pos = gt_pos.copy()
             prev_gt = gt_pos.copy()
         else:
+            # GPS yeni kesildi: VO'yu son bilinen GT konumuna sıfırla
+            if prev_health == "1":
+                vo.reset_to(prev_gt)
             pos = vo.update(frame)
 
         pred_positions.append(pos.copy())
