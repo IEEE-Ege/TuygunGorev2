@@ -30,14 +30,21 @@ FEATURE_PARAMS = dict(maxCorners=500, qualityLevel=0.01, minDistance=10, blockSi
 # Processing scale: downsample for faster + more stable LK (large pixel motion at full res)
 PROCESS_SCALE = 0.25
 
+# After this many GPS=0 frames, freeze the VO position (hold strategy).
+# LK VO drifts in the wrong direction beyond this point; holding gives lower RMSE.
+VO_HOLD_AFTER = 225
+
 
 class VisualOdometry:
     """
     Monocular VO for near-nadir UAV camera.
 
-    XY : LK optical flow → affine transform → translation in pixels → metres
-    Z  : altitude velocity model from GPS=1 history
-    Scale (m/px): calibrated as GT_xy_delta / raw_pixel_delta — no feedback loop
+    GPS=0 strategy:
+      1. Frames 0-49  : extrapolate with last GT velocity
+      2. Frames 50-224: LK sparse optical flow → affine transform → position update
+      3. Frames 225+  : hold the last estimated position (VO drift exceeds hold error)
+
+    Scale (m/px): per-axis, calibrated from GT_delta / pixel_delta during GPS=1.
     """
 
     def __init__(self, K: np.ndarray, dist: np.ndarray):
@@ -61,10 +68,20 @@ class VisualOdometry:
         # Z model: mean altitude from GPS=1 + slow velocity trend
         self._z_deltas: deque = deque(maxlen=30)
         self._z_velocity = 0.0
-        self._z_values: list[float] = []   # all GPS=1 Z values → mean altitude
+        self._z_values: list[float] = []
 
         # Max plausible per-frame movement (metres) — outlier guard
         self._max_move_per_frame = 5.0
+
+        # GT velocity extrapolation for early GPS=0 frames
+        self._gt_vel_samples: list[np.ndarray] = []
+        self._gt_vel = np.zeros(3, dtype=np.float64)
+        self._extrap_frame = 0
+        self._extrap_duration = 50
+        self._extrap_active = False
+
+        # GPS=0 frame counter — triggers hold after VO_HOLD_AFTER frames
+        self._gps0_frame = 0
 
     # ------------------------------------------------------------------
     def _undistort(self, gray: np.ndarray) -> np.ndarray:
@@ -90,12 +107,18 @@ class VisualOdometry:
             return None
         return np.array([M[0, 2], M[1, 2]], dtype=np.float64)
 
-    # ------------------------------------------------------------------
     def calibrate(self, gt_pos: np.ndarray, prev_gt_pos: np.ndarray):
         """
         Update m/px scale and Z velocity from GT.
         Uses raw pixel delta stored by last update() — no feedback loop.
         """
+        # Track GT velocity for extrapolation at GPS transition
+        self._gt_vel_samples.append(gt_pos.copy() - prev_gt_pos.copy())
+        if len(self._gt_vel_samples) > 10:
+            self._gt_vel_samples.pop(0)
+        if len(self._gt_vel_samples) >= 3:
+            self._gt_vel = np.mean(self._gt_vel_samples, axis=0)
+
         # Z: track mean altitude and slow velocity trend
         self._z_values.append(gt_pos[2])
         dz = gt_pos[2] - prev_gt_pos[2]
@@ -128,6 +151,9 @@ class VisualOdometry:
 
     def reset_to(self, gt_pos: np.ndarray, reset_velocity: bool = False):
         self.pos = gt_pos.copy()
+        self._extrap_frame = 0
+        self._extrap_active = True
+        self._gps0_frame = 0
 
     def update(self, frame_bgr: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -145,17 +171,27 @@ class VisualOdometry:
                 if delta_px is not None:
                     self._last_px_delta = delta_px.copy()
 
-                    dx = -delta_px[0] * self.scale_x
-                    dy = -delta_px[1] * self.scale_y
-                    dz = self._z_velocity
+                    # Hold: after VO_HOLD_AFTER GPS=0 frames, freeze position
+                    if self._gps0_frame >= VO_HOLD_AFTER:
+                        pass  # position frozen
+                    elif self._extrap_active and self._extrap_frame < self._extrap_duration:
+                        self.pos += self._gt_vel
+                        self._extrap_frame += 1
+                        if self._extrap_frame >= self._extrap_duration:
+                            self._extrap_active = False
+                    else:
+                        self._extrap_active = False
+                        dx = -delta_px[0] * self.scale_x
+                        dy = -delta_px[1] * self.scale_y
+                        dz = self._z_velocity
 
-                    scale_ready = (len(self._scale_x_samples) > 0
-                                   or len(self._scale_y_samples) > 0)
-                    move = np.sqrt(dx**2 + dy**2 + dz**2)
-                    if scale_ready and move < self._max_move_per_frame:
-                        self.pos[0] += dx
-                        self.pos[1] += dy
-                        self.pos[2] += dz
+                        scale_ready = (len(self._scale_x_samples) > 0
+                                       or len(self._scale_y_samples) > 0)
+                        move = np.sqrt(dx**2 + dy**2 + dz**2)
+                        if scale_ready and move < self._max_move_per_frame:
+                            self.pos[0] += dx
+                            self.pos[1] += dy
+                            self.pos[2] += dz
 
                 tracked_curr = curr_good.reshape(-1, 1, 2)
 
@@ -165,6 +201,8 @@ class VisualOdometry:
             self.prev_pts = tracked_curr
 
         self.prev_gray = gray
+        self._gps0_frame += 1
+
         return self.pos.copy()
 
 
