@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .env
 _images/
+_mock_images/
 _logs/
 *.pdf
 *.docx
