@@ -4,6 +4,7 @@ import requests
 import os
 import cv2
 import numpy as np
+from collections import deque
 
 from .constants import classes, landing_statuses
 from .detected_object import DetectedObject
@@ -19,99 +20,115 @@ RGB_CAMERA_MATRIX = np.array([
 
 RGB_DIST_COEFFS = np.array([0.0798, -0.1867, 0.0, 0.0], dtype=np.float64)
 
-MIN_MATCHES = 30  # Minimum good matches to trust motion estimate
+LK_PARAMS = dict(
+    winSize=(21, 21),
+    maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+)
+FEATURE_PARAMS = dict(maxCorners=500, qualityLevel=0.01, minDistance=10, blockSize=7)
 
 
 class VisualOdometry:
-    """Monocular VO via ORB feature matching + Essential Matrix decomposition."""
+    """
+    Monocular VO for near-nadir UAV camera.
+
+    XY : Lucas-Kanade sparse optical flow → affine → scaled translation
+    Z  : velocity model extrapolated from GPS-healthy altitude history
+    Scale: calibrated from consecutive GT XY deltas vs pixel flow deltas
+    """
 
     def __init__(self, K: np.ndarray, dist: np.ndarray):
         self.K = K
         self.dist = dist
-        self.orb = cv2.ORB_create(nfeatures=2000)
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
-        # Cumulative pose in world frame
         self.pos = np.zeros(3, dtype=np.float64)
-        self.R_total = np.eye(3, dtype=np.float64)
 
-        # Previous frame state
-        self.prev_gray = None
-        self.prev_kp = None
-        self.prev_des = None
+        self.prev_gray: np.ndarray | None = None
+        self.prev_pts: np.ndarray | None = None
 
-        # Scale calibration
-        self.scale = 1.0
+        self.xy_scale = 1.0
         self._scale_samples: list[float] = []
-        self._prev_vo_pos = np.zeros(3, dtype=np.float64)
+
+        # Z velocity model
+        self._z_deltas: deque = deque(maxlen=30)
+        self._z_velocity = 0.0
+
+        self._prev_vo_xy = np.zeros(2, dtype=np.float64)
+        self._curr_pts_tracked: np.ndarray | None = None  # for feature refresh
 
     # ------------------------------------------------------------------
     def _undistort(self, gray: np.ndarray) -> np.ndarray:
         return cv2.undistort(gray, self.K, self.dist)
 
-    def _detect(self, gray):
-        kp, des = self.orb.detectAndCompute(gray, None)
-        return kp, des
+    def _detect_features(self, gray: np.ndarray) -> np.ndarray | None:
+        return cv2.goodFeaturesToTrack(gray, mask=None, **FEATURE_PARAMS)
 
-    def _match(self, des1, des2):
-        if des1 is None or des2 is None or len(des1) < 8 or len(des2) < 8:
-            return []
-        raw = self.matcher.knnMatch(des1, des2, k=2)
-        good = [m for m, n in raw if m.distance < 0.75 * n.distance]
-        return good
-
-    def _estimate_motion(self, kp1, kp2, matches):
-        """Returns R, t (unit vector) or (None, None) on failure."""
-        if len(matches) < MIN_MATCHES:
-            return None, None
-        pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
-        pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
-
-        E, mask = cv2.findEssentialMat(
-            pts1, pts2, self.K,
-            method=cv2.RANSAC, prob=0.999, threshold=1.0
+    def _track(self, prev_gray, curr_gray, prev_pts):
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, prev_pts, None, **LK_PARAMS
         )
-        if E is None:
-            return None, None
+        mask = status.ravel().astype(bool)
+        return prev_pts[mask], curr_pts[mask]
 
-        _, R, t, _ = cv2.recoverPose(E, pts1, pts2, self.K, mask=mask)
-        return R, t  # t is unit vector in camera1 coords
+    def _affine_xy_delta(self, src, dst) -> np.ndarray | None:
+        if len(src) < 8:
+            return None
+        M, inliers = cv2.estimateAffinePartial2D(
+            src, dst, method=cv2.RANSAC, ransacReprojThreshold=2.0
+        )
+        if M is None or (inliers is not None and inliers.sum() < 6):
+            return None
+        return np.array([M[0, 2], M[1, 2]], dtype=np.float64)
 
     # ------------------------------------------------------------------
-    def calibrate_scale(self, gt_pos: np.ndarray, prev_gt_pos: np.ndarray):
-        """Update scale using consecutive GT frame distance vs VO delta."""
-        gt_delta = np.linalg.norm(gt_pos - prev_gt_pos)
-        vo_delta = np.linalg.norm(self.pos - self._prev_vo_pos)
-        if gt_delta > 0.05 and vo_delta > 1e-4:
-            self._scale_samples.append(gt_delta / vo_delta)
-            if len(self._scale_samples) > 50:
-                self._scale_samples.pop(0)
-            self.scale = float(np.median(self._scale_samples))
+    def calibrate(self, gt_pos: np.ndarray, prev_gt_pos: np.ndarray):
+        """Update XY scale and Z velocity from GT. Call on every GPS=1 frame."""
+        # Z velocity
+        self._z_deltas.append(gt_pos[2] - prev_gt_pos[2])
+        if len(self._z_deltas) >= 5:
+            self._z_velocity = float(np.median(list(self._z_deltas)))
+
+        # XY scale
+        gt_xy = np.linalg.norm(gt_pos[:2] - prev_gt_pos[:2])
+        vo_xy = np.linalg.norm(self.pos[:2] - self._prev_vo_xy)
+        if gt_xy > 0.05 and vo_xy > 0.5:
+            s = gt_xy / vo_xy
+            if 1e-4 < s < 1e3:
+                self._scale_samples.append(s)
+                if len(self._scale_samples) > 60:
+                    self._scale_samples.pop(0)
+                self.xy_scale = float(np.median(self._scale_samples))
 
     def reset_to(self, gt_pos: np.ndarray):
-        """Hard-reset cumulative position to ground truth."""
         self.pos = gt_pos.copy()
 
     def update(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Process a new frame; return current cumulative position."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         gray = self._undistort(gray)
-        kp, des = self._detect(gray)
 
-        if self.prev_gray is not None and self.prev_kp is not None:
-            matches = self._match(self.prev_des, des)
-            R, t = self._estimate_motion(self.prev_kp, kp, matches)
+        tracked_curr: np.ndarray | None = None
 
-            if R is not None and t is not None:
-                self._prev_vo_pos = self.pos.copy()
-                # t is in camera1 frame → rotate to world frame, then scale
-                self.pos += self.scale * (self.R_total @ t).flatten()
-                self.R_total = self.R_total @ R
+        if self.prev_gray is not None and self.prev_pts is not None and len(self.prev_pts) >= 10:
+            prev_good, curr_good = self._track(self.prev_gray, gray, self.prev_pts)
+
+            if len(prev_good) >= 8:
+                delta_px = self._affine_xy_delta(prev_good, curr_good)
+                if delta_px is not None:
+                    self._prev_vo_xy = self.pos[:2].copy()
+                    # Nadir camera: image x/y shift → world -x/-y (camera looking down)
+                    self.pos[0] -= delta_px[0] * self.xy_scale
+                    self.pos[1] -= delta_px[1] * self.xy_scale
+                    self.pos[2] += self._z_velocity
+
+                tracked_curr = curr_good.reshape(-1, 1, 2)
+
+        # Refresh features when too few
+        if tracked_curr is None or len(tracked_curr) < 50:
+            self.prev_pts = self._detect_features(gray)
+        else:
+            self.prev_pts = tracked_curr
 
         self.prev_gray = gray
-        self.prev_kp = kp
-        self.prev_des = des
-
         return self.pos.copy()
 
 
@@ -123,10 +140,9 @@ class ObjectDetectionModel:
 
         self.vo = VisualOdometry(RGB_CAMERA_MATRIX, RGB_DIST_COEFFS)
         self._prev_gt = np.zeros(3, dtype=np.float64)
-        self._prev_health = '1'   # track health transitions
+        self._prev_health = '1'
         self._images_folder = None
 
-        # Object detection model placeholder
         self.det_model = None
 
     @staticmethod
@@ -157,22 +173,10 @@ class ObjectDetectionModel:
         self._images_folder = images_folder
         return self.detect(prediction, health_status)
 
-    # ------------------------------------------------------------------
     def _run_object_detection(self, img_path: str, prediction):
-        """
-        Nesne tespiti entegrasyon noktası (Görev 1).
-        YOLO veya başka model buraya eklenir.
-        """
+        """Görev 1 entegrasyon noktası."""
         if self.det_model is None:
             return
-        # Örnek (ultralytics YOLO):
-        # results = self.det_model(img_path)
-        # for box in results[0].boxes:
-        #     cls_id = int(box.cls)
-        #     x1, y1, x2, y2 = box.xyxy[0].tolist()
-        #     prediction.add_detected_object(
-        #         DetectedObject(cls_id, landing_statuses["InisAlaniDegil"], x1, y1, x2, y2)
-        #     )
 
     def _load_frame(self, prediction) -> np.ndarray | None:
         if self._images_folder is None:
@@ -181,17 +185,19 @@ class ObjectDetectionModel:
         img_path = os.path.join(self._images_folder, image_name)
         if not os.path.exists(img_path):
             return None
-        return cv2.imread(img_path)
+        img = cv2.imread(img_path)
+        if img is None:
+            img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        return img
 
-    # ------------------------------------------------------------------
     def detect(self, prediction, health_status):
-        image_name = prediction.image_url.split("/")[-1]
-        img_path = os.path.join(self._images_folder or "", image_name)
+        img_path = os.path.join(
+            self._images_folder or "",
+            prediction.image_url.split("/")[-1]
+        )
 
-        # --- Görev 1: Nesne tespiti ---
         self._run_object_detection(img_path, prediction)
 
-        # --- Görev 2: Pozisyon kestirimi ---
         frame = self._load_frame(prediction)
 
         if health_status == '1':
@@ -203,15 +209,14 @@ class ObjectDetectionModel:
 
             if frame is not None:
                 self.vo.update(frame)
-                self.vo.calibrate_scale(gt_pos, self._prev_gt)
-                # Reset yalnızca GPS geri geldiğinde (0→1 geçişi)
+                self.vo.calibrate(gt_pos, self._prev_gt)
                 if self._prev_health == '0':
                     self.vo.reset_to(gt_pos)
 
             self._prev_gt = gt_pos.copy()
             tx, ty, tz = gt_pos[0], gt_pos[1], gt_pos[2]
 
-        else:  # health_status == '0'
+        else:
             if frame is not None:
                 pos = self.vo.update(frame)
             else:
