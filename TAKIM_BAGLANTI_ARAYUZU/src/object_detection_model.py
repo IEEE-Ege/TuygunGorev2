@@ -27,6 +27,9 @@ LK_PARAMS = dict(
 )
 FEATURE_PARAMS = dict(maxCorners=500, qualityLevel=0.01, minDistance=10, blockSize=7)
 
+# Processing scale: downsample for faster + more stable LK (large pixel motion at full res)
+PROCESS_SCALE = 0.25
+
 
 class VisualOdometry:
     """
@@ -46,7 +49,7 @@ class VisualOdometry:
         self.prev_gray: np.ndarray | None = None
         self.prev_pts: np.ndarray | None = None
 
-        # Per-axis scale: metres per pixel (calibrated from GT separately for X and Y)
+        # Per-axis scale: metres per pixel
         self.scale_x = 1.0
         self.scale_y = 1.0
         self._scale_x_samples: list[float] = []
@@ -55,9 +58,13 @@ class VisualOdometry:
         # Last raw pixel delta (set by update, read by calibrate)
         self._last_px_delta: np.ndarray | None = None
 
-        # Z velocity model
+        # Z model: mean altitude from GPS=1 + slow velocity trend
         self._z_deltas: deque = deque(maxlen=30)
         self._z_velocity = 0.0
+        self._z_values: list[float] = []   # all GPS=1 Z values → mean altitude
+
+        # Max plausible per-frame movement (metres) — outlier guard
+        self._max_move_per_frame = 5.0
 
     # ------------------------------------------------------------------
     def _undistort(self, gray: np.ndarray) -> np.ndarray:
@@ -74,7 +81,6 @@ class VisualOdometry:
         return prev_pts[mask], curr_pts[mask]
 
     def _affine_delta(self, src, dst) -> np.ndarray | None:
-        """Fit partial affine (rotation+scale+translation); return tx,ty in pixels."""
         if len(src) < 8:
             return None
         M, inliers = cv2.estimateAffinePartial2D(
@@ -82,7 +88,7 @@ class VisualOdometry:
         )
         if M is None or (inliers is not None and inliers.sum() < 6):
             return None
-        return np.array([M[0, 2], M[1, 2]], dtype=np.float64)  # raw pixels
+        return np.array([M[0, 2], M[1, 2]], dtype=np.float64)
 
     # ------------------------------------------------------------------
     def calibrate(self, gt_pos: np.ndarray, prev_gt_pos: np.ndarray):
@@ -90,13 +96,15 @@ class VisualOdometry:
         Update m/px scale and Z velocity from GT.
         Uses raw pixel delta stored by last update() — no feedback loop.
         """
-        # Z velocity
+        # Z: track mean altitude and slow velocity trend
+        self._z_values.append(gt_pos[2])
         dz = gt_pos[2] - prev_gt_pos[2]
         self._z_deltas.append(dz)
         if len(self._z_deltas) >= 5:
-            self._z_velocity = float(np.median(list(self._z_deltas)))
+            # Damped velocity: blend median delta with mean-reversion toward mean Z
+            self._z_velocity = float(np.median(list(self._z_deltas))) * 0.3
 
-        # Per-axis scale: metres / pixel (X and Y calibrated independently)
+        # Per-axis scale: metres / pixel
         if self._last_px_delta is not None:
             px = self._last_px_delta
             gt_dx = gt_pos[0] - prev_gt_pos[0]
@@ -118,12 +126,13 @@ class VisualOdometry:
                         self._scale_y_samples.pop(0)
                     self.scale_y = float(np.median(self._scale_y_samples))
 
-    def reset_to(self, gt_pos: np.ndarray):
+    def reset_to(self, gt_pos: np.ndarray, reset_velocity: bool = False):
         self.pos = gt_pos.copy()
 
     def update(self, frame_bgr: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         gray = self._undistort(gray)
+        gray = cv2.resize(gray, (0, 0), fx=PROCESS_SCALE, fy=PROCESS_SCALE)
 
         self._last_px_delta = None
         tracked_curr: np.ndarray | None = None
@@ -135,14 +144,21 @@ class VisualOdometry:
                 delta_px = self._affine_delta(prev_good, curr_good)
                 if delta_px is not None:
                     self._last_px_delta = delta_px.copy()
-                    # Nadir camera: image shifts opposite to drone XY motion
-                    self.pos[0] -= delta_px[0] * self.scale_x
-                    self.pos[1] -= delta_px[1] * self.scale_y
-                    self.pos[2] += self._z_velocity
+
+                    dx = -delta_px[0] * self.scale_x
+                    dy = -delta_px[1] * self.scale_y
+                    dz = self._z_velocity
+
+                    scale_ready = (len(self._scale_x_samples) > 0
+                                   or len(self._scale_y_samples) > 0)
+                    move = np.sqrt(dx**2 + dy**2 + dz**2)
+                    if scale_ready and move < self._max_move_per_frame:
+                        self.pos[0] += dx
+                        self.pos[1] += dy
+                        self.pos[2] += dz
 
                 tracked_curr = curr_good.reshape(-1, 1, 2)
 
-        # Refresh features when too few
         if tracked_curr is None or len(tracked_curr) < 50:
             self.prev_pts = self._detect_features(gray)
         else:
@@ -230,7 +246,7 @@ class ObjectDetectionModel:
                 self.vo.update(frame)
                 self.vo.calibrate(gt_pos, self._prev_gt)
                 if self._prev_health == '0':
-                    self.vo.reset_to(gt_pos)
+                    self.vo.reset_to(gt_pos, reset_velocity=True)
 
             self._prev_gt = gt_pos.copy()
             tx, ty, tz = gt_pos[0], gt_pos[1], gt_pos[2]
