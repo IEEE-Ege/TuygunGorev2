@@ -2,20 +2,21 @@
 Mock TEKNOFEST değerlendirme sunucusu.
 Gerçek sunucu olmadan tam pipeline testi için.
 
-Başlatma:
-  python3 mock_server.py                        # varsayılan: sentetik video üret + sun
-  python3 mock_server.py --video clip.mp4       # gerçek video dosyası sun
+Kullanım:
+  # Gerçek frame klasörü + CSV ile:
+  python3 mock_server.py --frames ../2025/THYZ_2025_Oturum_2-2 --csv ../2025/THYZ_2025_Oturum_2_Translation.csv
+
+  # Sentetik (frame/csv yoksa):
+  python3 mock_server.py
 
 Ayrı terminalde:
   python3 main.py
 """
 
 import argparse
-import json
+import csv
 import math
 import os
-import threading
-import time
 from pathlib import Path
 
 import cv2
@@ -24,113 +25,127 @@ from flask import Flask, jsonify, request, send_from_directory
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------------
-# Ayarlar
-# ---------------------------------------------------------------------------
-VIDEO_DIR = Path("./_mock_images/test_session/")
-FRAMES_PER_SECOND = 7.5
 TOKEN = "mock_token_123"
+SESSION_NAME = "test_session"
 
 frames_data: list[dict] = []
 translations_data: list[dict] = []
 predictions_received: list[dict] = []
+_frames_dir: Path = Path(".")
+
 
 # ---------------------------------------------------------------------------
-# Sentetik video üretici
+# Veri yükleme
 # ---------------------------------------------------------------------------
 
-def _generate_synthetic_video(out_path: Path, n_frames: int = 200):
+def load_from_folder_and_csv(frames_dir: Path, csv_path: Path, health_split: float = 0.2):
     """
-    Sabit yükseklikten aşağı bakan kamerayı simüle eder.
-    Zemin: izgara desen. Kamera yavaş X-Y düzleminde ileri gider.
+    frames_dir : frame_000000.webp / .jpg / .png içeren klasör
+    csv_path   : translation_x,translation_y,translation_z,frame_numbers
+    health_split: ilk bu oran GPS=1, geri kalan GPS=0
     """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    h, w = 540, 960
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    vpath = str(out_path)
-    writer = cv2.VideoWriter(vpath, fourcc, FRAMES_PER_SECOND, (w, h))
+    global frames_data, translations_data, _frames_dir
+    _frames_dir = frames_dir
 
-    for i in range(n_frames):
-        # Kamera ofseti: yavaş X-Y hareketi
-        cx = int(i * 2.5) % w
-        cy = int(i * 1.5) % h
-        img = np.zeros((h * 2, w * 2, 3), dtype=np.uint8)
-        img[:] = (40, 40, 40)
-        # Izgara çiz
-        step = 80
-        for x in range(0, w * 2, step):
-            cv2.line(img, (x, 0), (x, h * 2), (80, 80, 80), 1)
-        for y in range(0, h * 2, step):
-            cv2.line(img, (0, y), (w * 2, y), (80, 80, 80), 1)
-        # Bazı noktalar (feature için)
-        rng = np.random.default_rng(42)
-        for _ in range(60):
-            px = int(rng.integers(0, w * 2))
-            py = int(rng.integers(0, h * 2))
-            cv2.circle(img, (px, py), 6, (0, 200, 255), -1)
-        # Kırp — kamera hareketi simülasyonu
-        crop = img[cy: cy + h, cx: cx + w]
-        writer.write(crop)
+    # CSV oku
+    gt: dict[str, tuple[float, float, float]] = {}
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fname = row["frame_numbers"].strip()
+            gt[fname] = (float(row["translation_x"]),
+                         float(row["translation_y"]),
+                         float(row["translation_z"]))
 
-    writer.release()
-    print(f"[mock] Sentetik video oluşturuldu: {vpath}  ({n_frames} frame)")
-    return vpath
-
-
-def _build_frames_and_translations(video_path: str):
-    """Video'yu frame frame okur, JPEG'e kaydeder, GT pozisyon üretir."""
-    global frames_data, translations_data
-    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[mock] Video yüklendi: {total} frame")
-
-    # Basit GT: düzgün dairesel yörünge (gerçekçi görünüm için)
-    radius = 10.0  # metre
-    alt = 30.0     # sabit yükseklik
+    # Frame dosyalarını sırala
+    exts = {".webp", ".jpg", ".jpeg", ".png"}
+    files = sorted(p for p in frames_dir.iterdir() if p.suffix.lower() in exts)
+    total = len(files)
+    print(f"[mock] {total} frame, {len(gt)} GT satırı bulundu.")
 
     frames_data = []
     translations_data = []
 
-    idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        fname = f"frame_{idx:05d}.jpg"
-        fpath = VIDEO_DIR / fname
-        cv2.imwrite(str(fpath), frame)
+    for i, fpath in enumerate(files):
+        stem = fpath.stem  # e.g. "frame_000000"
+        fname_key = stem   # CSV'deki frame_numbers değeriyle eşleş
 
         frames_data.append({
-            "url": f"/frame_endpoint/{idx}/",
-            "image_url": f"/test_session/{fname}",
-            "video_name": "test_session",
+            "url": f"/frame_endpoint/{i}/",
+            "image_url": f"/{SESSION_NAME}/{fpath.name}",
+            "video_name": SESSION_NAME,
         })
 
-        # GT pozisyon: dairesel
-        angle = (2 * math.pi * idx) / max(total, 1)
-        x = radius * math.cos(angle) - radius   # başlangıç 0
-        y = radius * math.sin(angle)
-        z = alt
+        if fname_key in gt:
+            x, y, z = gt[fname_key]
+        else:
+            x, y, z = 0.0, 0.0, 0.0
 
-        # İlk %20 frame GPS sağlıklı, geri kalan GPS yok
-        health = "1" if idx < total * 0.2 else "0"
-
+        health = "1" if i < total * health_split else "0"
         translations_data.append({
-            "translation_x": str(round(x, 4)),
-            "translation_y": str(round(y, 4)),
-            "translation_z": str(round(z, 4)),
+            "translation_x": str(x),
+            "translation_y": str(y),
+            "translation_z": str(z),
             "health_status": health,
         })
-        idx += 1
 
-    cap.release()
-    print(f"[mock] {idx} frame hazırlandı. İlk %20 GPS=1, kalan GPS=0")
+    print(f"[mock] İlk %{int(health_split*100)} GPS=1 ({int(total*health_split)} frame), "
+          f"kalan GPS=0 ({total - int(total*health_split)} frame)")
+
+
+def generate_synthetic(n_frames: int = 150):
+    """Sentetik frame + GT üretir (gerçek veri yoksa)."""
+    global frames_data, translations_data, _frames_dir
+    out_dir = Path("./_mock_images/test_session")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _frames_dir = out_dir
+
+    h, w = 540, 960
+    radius = 10.0
+    alt = 30.0
+    rng = np.random.default_rng(42)
+
+    frames_data = []
+    translations_data = []
+
+    for i in range(n_frames):
+        # Izgara görüntü
+        img = np.full((h, w, 3), 40, dtype=np.uint8)
+        cx_off = int(i * 2.5) % 80
+        cy_off = int(i * 1.5) % 80
+        for x in range(-cx_off, w, 80):
+            cv2.line(img, (x, 0), (x, h), (80, 80, 80), 1)
+        for y in range(-cy_off, h, 80):
+            cv2.line(img, (0, y), (w, y), (80, 80, 80), 1)
+        for _ in range(40):
+            px, py = int(rng.integers(0, w)), int(rng.integers(0, h))
+            cv2.circle(img, (px, py), 5, (0, 200, 255), -1)
+
+        fname = f"frame_{i:06d}.jpg"
+        cv2.imwrite(str(out_dir / fname), img)
+
+        angle = (2 * math.pi * i) / n_frames
+        x_gt = radius * math.cos(angle) - radius
+        y_gt = radius * math.sin(angle)
+
+        frames_data.append({
+            "url": f"/frame_endpoint/{i}/",
+            "image_url": f"/{SESSION_NAME}/{fname}",
+            "video_name": SESSION_NAME,
+        })
+        health = "1" if i < n_frames * 0.2 else "0"
+        translations_data.append({
+            "translation_x": str(round(x_gt, 4)),
+            "translation_y": str(round(y_gt, 4)),
+            "translation_z": str(round(alt, 4)),
+            "health_status": health,
+        })
+
+    print(f"[mock] Sentetik {n_frames} frame oluşturuldu → {out_dir}")
 
 
 # ---------------------------------------------------------------------------
-# Flask endpoint'leri  (gerçek sunucuyla birebir aynı)
+# Flask endpoint'leri
 # ---------------------------------------------------------------------------
 
 @app.route("/auth/", methods=["POST"])
@@ -159,29 +174,26 @@ def send_prediction():
     data = request.get_json(force=True)
     predictions_received.append(data)
     n = len(predictions_received)
-    if n % 50 == 0:
+    if n % 100 == 0 or n == len(frames_data):
         _print_score()
     return jsonify({"status": "ok", "received": n}), 201
 
 
 @app.route("/session/", methods=["GET"])
 def session():
-    return jsonify({"session_name": "test_session"}), 200
+    return jsonify({"session_name": SESSION_NAME}), 200
 
 
-# Statik frame dosyası sun  (connection_handler media/ prefix'i ekliyor)
-@app.route("/media/test_session/<path:filename>")
+@app.route(f"/media/{SESSION_NAME}/<path:filename>")
 def serve_frame(filename):
-    return send_from_directory(str(VIDEO_DIR), filename)
+    return send_from_directory(str(_frames_dir), filename)
 
 
 # ---------------------------------------------------------------------------
-# Skor hesapla (terminale yaz)
+# Skor
 # ---------------------------------------------------------------------------
 
 def _print_score():
-    if not predictions_received:
-        return
     errors = []
     for pred in predictions_received:
         trans_list = pred.get("detected_translations", [])
@@ -189,7 +201,6 @@ def _print_score():
             continue
         t = trans_list[0]
         furl = pred.get("frame", "")
-        # frame index'i URL'den çıkar
         try:
             idx = int(furl.strip("/").split("/")[-1])
         except (ValueError, IndexError):
@@ -204,7 +215,7 @@ def _print_score():
 
     if errors:
         rmse = math.sqrt(sum(e**2 for e in errors) / len(errors))
-        print(f"[mock] Ara skor — {len(errors)} tahmin  |  RMSE: {rmse:.4f} m")
+        print(f"[mock] {len(errors)}/{len(frames_data)} tahmin  |  RMSE: {rmse:.4f} m")
 
 
 # ---------------------------------------------------------------------------
@@ -213,18 +224,18 @@ def _print_score():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", type=str, default=None, help="Gerçek video dosyası (yoksa sentetik üretilir)")
+    parser.add_argument("--frames", type=str, default=None, help="Frame klasörü (webp/jpg/png)")
+    parser.add_argument("--csv", type=str, default=None, help="GT CSV dosyası")
+    parser.add_argument("--health-split", type=float, default=0.2,
+                        help="İlk bu oran GPS=1, kalan GPS=0 (varsayılan 0.2)")
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
 
-    if args.video:
-        video_path = args.video
+    if args.frames and args.csv:
+        load_from_folder_and_csv(Path(args.frames), Path(args.csv), args.health_split)
     else:
-        video_path = str(VIDEO_DIR.parent / "synthetic.mp4")
-        if not Path(video_path).exists():
-            _generate_synthetic_video(Path(video_path), n_frames=150)
-
-    _build_frames_and_translations(video_path)
+        print("[mock] --frames/--csv verilmedi, sentetik veri kullanılıyor.")
+        generate_synthetic()
 
     # .env oluştur
     env_path = Path("./config/.env")
@@ -232,11 +243,12 @@ def main():
     env_path.write_text(
         f"TEAM_NAME=tuygun\n"
         f"PASSWORD=test123\n"
-        f'EVALUATION_SERVER_URL="http://127.0.0.1:{args.port}/"\n'
-        f"SESSION_NAME=test_session\n"
+        f'EVALUATION_SERVER_URL=http://127.0.0.1:{args.port}/\n'
+        f"SESSION_NAME={SESSION_NAME}\n"
     )
-    print(f"[mock] config/.env yazıldı → http://127.0.0.1:{args.port}/")
-    print(f"[mock] Ayrı terminalde: source ../.venv/bin/activate && python3 main.py")
+    print(f"[mock] config/.env yazıldı")
+    print(f"[mock] Sunucu: http://127.0.0.1:{args.port}/")
+    print(f"[mock] Ayrı terminalde çalıştır: python3 main.py")
     print("-" * 60)
 
     app.run(port=args.port, debug=False)
