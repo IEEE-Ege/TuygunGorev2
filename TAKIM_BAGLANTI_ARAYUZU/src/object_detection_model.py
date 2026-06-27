@@ -32,50 +32,48 @@ class VOInitializer:
     """
     Calibration from GPS=1 frames.
 
-    Collects paired (GNSS_delta, pixel_delta) samples and at fit() computes:
-      scale   — world metres per pixel       (magnitude ratio, Paper 3)
-      theta   — camera→world heading angle   (cumulative GNSS direction, Paper 3)
-      R_inv   — 2×2 matrix: world_disp = R_inv @ pixel_disp
+    Collects paired (GNSS_delta, pixel_delta) samples and at fit() computes
+    per-axis scale factors (scale_x, scale_y) using rolling-median calibration.
+    Per-axis is empirically more robust than a fixed R_inv matrix when the
+    drone yaws continuously (camera heading changes during flight).
     """
 
+    _WIN = 60   # rolling window size for median scale
+
     def __init__(self):
-        self._samples: list  = []
-        self._cum_gt         = np.zeros(2, dtype=np.float64)
-        self.R_inv: np.ndarray | None = None
-        self.scale = 1.0
-        self.theta = 0.0
-        self.ready = False
+        self._sx_samples: list[float] = []
+        self._sy_samples: list[float] = []
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+        self.ready   = False
 
     def add_sample(self, gt_delta: np.ndarray, pixel_delta: np.ndarray):
-        self._cum_gt += gt_delta[:2]
-        if (np.linalg.norm(gt_delta[:2]) > 0.05
-                and np.linalg.norm(pixel_delta) > 0.5):
-            self._samples.append((gt_delta[0], gt_delta[1],
-                                   pixel_delta[0], pixel_delta[1]))
+        gt_dx, gt_dy = float(gt_delta[0]), float(gt_delta[1])
+        tx,    ty    = float(pixel_delta[0]), float(pixel_delta[1])
+
+        if abs(gt_dx) > 0.05 and abs(tx) > 1.0:
+            sx = abs(gt_dx) / abs(tx)
+            if 1e-4 < sx < 100.0:
+                self._sx_samples.append(sx)
+                if len(self._sx_samples) > self._WIN:
+                    self._sx_samples.pop(0)
+
+        if abs(gt_dy) > 0.05 and abs(ty) > 1.0:
+            sy = abs(gt_dy) / abs(ty)
+            if 1e-4 < sy < 100.0:
+                self._sy_samples.append(sy)
+                if len(self._sy_samples) > self._WIN:
+                    self._sy_samples.pop(0)
+
+        if self._sx_samples:
+            self.scale_x = float(np.median(self._sx_samples))
+        if self._sy_samples:
+            self.scale_y = float(np.median(self._sy_samples))
+        if self._sx_samples or self._sy_samples:
+            self.ready = True
 
     def fit(self) -> bool:
-        if len(self._samples) < 20:
-            return False
-
-        arr  = np.array(self._samples, dtype=np.float64)
-        gt_dx, gt_dy = arr[:, 0], arr[:, 1]
-        tx,    ty    = arr[:, 2], arr[:, 3]
-
-        gt_mag = np.sqrt(gt_dx**2 + gt_dy**2)
-        px_mag = np.sqrt(tx**2   + ty**2)
-        valid  = (gt_mag > 0.05) & (px_mag > 0.5)
-        if valid.sum() < 10:
-            return False
-
-        self.scale = float(np.median(gt_mag[valid] / px_mag[valid]))
-        self.theta = float(np.arctan2(self._cum_gt[1], self._cum_gt[0]))
-
-        c, s = np.cos(self.theta), np.sin(self.theta)
-        # world = -scale * Rot(theta) @ pixel  =>  R_inv = -scale * Rot(theta)
-        self.R_inv = -self.scale * np.array([[c, -s], [s, c]], dtype=np.float64)
-
-        self.ready = True
-        return True
+        return self.ready
 
 
 # =============================================================================
@@ -179,7 +177,7 @@ class FeatureTracker:
 
 # =============================================================================
 class PoseEstimator:
-    """Converts pixel displacement → world (dx, dy) using VOInitializer.R_inv."""
+    """Converts pixel displacement → world (dx, dy) using per-axis scale."""
 
     MAX_MOVE_M = 5.0
 
@@ -190,8 +188,8 @@ class PoseEstimator:
         if pixel_delta is None or not self._init.ready:
             return np.zeros(3)
 
-        world_xy = self._init.R_inv @ pixel_delta
-        dx, dy   = float(world_xy[0]), float(world_xy[1])
+        dx = -float(pixel_delta[0]) * self._init.scale_x
+        dy = -float(pixel_delta[1]) * self._init.scale_y
 
         if np.sqrt(dx**2 + dy**2) > self.MAX_MOVE_M:
             return np.zeros(3)
